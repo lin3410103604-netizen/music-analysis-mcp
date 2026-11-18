@@ -2,3 +2,4 @@ fastmcp
 librosa
 soundfile
 numpy
+requests

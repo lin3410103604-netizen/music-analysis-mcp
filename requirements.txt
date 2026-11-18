@@ -1,0 +1,4 @@
+fastmcp
+librosa
+soundfile
+numpy

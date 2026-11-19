@@ -291,8 +291,6 @@ def load_audio_features(audio_path):
         hop_length=HOP_LENGTH,
         trim=False,
     )
-    del onset_env
-
     beat_times = librosa.frames_to_time(
         beat_frames, sr=sr, hop_length=HOP_LENGTH
     )
@@ -326,6 +324,8 @@ def load_audio_features(audio_path):
         "truncated": truncated,
         "bpm": round(bpm, 2),
         "beat_times": beat_times,
+        "onset_env": onset_env,
+        "beat_frames": beat_frames,
         "beat_count": int(len(beat_times)),
         "rms": rms, "centroid": centroid,
         "bandwidth": bandwidth, "rolloff": rolloff,
@@ -335,7 +335,99 @@ def load_audio_features(audio_path):
 
 
 # =========================================================
-# 6. 特征统计
+# 6. 节拍、重音与低能量区间分析
+# =========================================================
+
+def analyze_rhythm_details(data):
+    """输出节拍时间点、相对强弱、重音候选和低能量区间。
+
+    强弱标签仅表示本曲内部的相对起音强度，不代表已识别出准确拍号/小节首拍。
+    """
+    beat_times = np.asarray(data["beat_times"], dtype=np.float32)
+    onset_env = np.asarray(data["onset_env"], dtype=np.float32)
+    rms = np.asarray(data["rms"], dtype=np.float32)
+    frame_times = np.asarray(data["frame_times"], dtype=np.float32)
+    duration = float(data["duration"])
+
+    if len(beat_times) and len(onset_env):
+        beat_frames = np.clip(
+            np.rint(beat_times * SAMPLE_RATE / HOP_LENGTH).astype(int),
+            0, len(onset_env) - 1,
+        )
+        beat_scores = onset_env[beat_frames]
+        strong_threshold = float(np.percentile(beat_scores, 70))
+        beat_points = [{
+            "time": round(float(t), 3),
+            "relative_strength": round(float(score), 4),
+            "accent_class": "相对强拍候选" if score >= strong_threshold else "相对弱拍候选",
+        } for t, score in zip(beat_times, beat_scores)]
+    else:
+        beat_points = []
+        beat_scores = np.array([], dtype=np.float32)
+        strong_threshold = 0.0
+
+    # 起音包络局部峰值：作为音乐重音候选，不直接等同于鼓点或小节重拍。
+    accent_candidates = []
+    if len(onset_env) >= 3:
+        threshold = float(np.percentile(onset_env, 85))
+        min_distance_frames = max(1, int(round(0.25 * SAMPLE_RATE / HOP_LENGTH)))
+        last_kept = -min_distance_frames
+        for idx in range(1, len(onset_env) - 1):
+            value = float(onset_env[idx])
+            if (value >= threshold and value >= onset_env[idx - 1]
+                    and value > onset_env[idx + 1]
+                    and idx - last_kept >= min_distance_frames):
+                t = float(frame_times[idx]) if idx < len(frame_times) else idx * HOP_LENGTH / SAMPLE_RATE
+                accent_candidates.append({
+                    "time": round(t, 3),
+                    "strength": round(value, 4),
+                    "description": "起音强度峰值候选，需结合听感确认",
+                })
+                last_kept = idx
+
+    # 用约 0.5 秒滑动平均 RMS 寻找持续低能量区间，避免把单帧波动当作停顿。
+    low_energy_intervals = []
+    if len(rms) and len(frame_times):
+        frame_step = HOP_LENGTH / SAMPLE_RATE
+        window_frames = max(1, int(round(0.5 / frame_step)))
+        kernel = np.ones(window_frames, dtype=np.float32) / window_frames
+        smooth_rms = np.convolve(rms, kernel, mode="same")
+        baseline = float(np.percentile(smooth_rms, 20))
+        silence_threshold = max(0.002, baseline * 0.35)
+        quiet = smooth_rms <= silence_threshold
+        starts = np.where(quiet & ~np.r_[False, quiet[:-1]])[0]
+        ends = np.where(quiet & ~np.r_[quiet[1:], False])[0] + 1
+        for start_idx, end_idx in zip(starts, ends):
+            start_t = float(frame_times[min(start_idx, len(frame_times) - 1)])
+            end_idx = min(end_idx, len(frame_times) - 1)
+            end_t = float(frame_times[end_idx]) + frame_step
+            if end_t - start_t >= 0.5:
+                low_energy_intervals.append({
+                    "start": round(max(0.0, start_t), 3),
+                    "end": round(min(duration, end_t), 3),
+                    "duration": round(min(duration, end_t) - max(0.0, start_t), 3),
+                    "description": "持续低能量区间，可能是停顿、尾奏或弱音段，需听感确认",
+                })
+
+    last_accent = max(accent_candidates, key=lambda x: x["time"]) if accent_candidates else None
+    return {
+        "beat_points": beat_points,
+        "beat_point_count": len(beat_points),
+        "relative_strong_beat_threshold": round(strong_threshold, 4),
+        "accent_candidates": accent_candidates,
+        "low_energy_intervals": low_energy_intervals,
+        "last_accent_candidate": last_accent,
+        "notes": [
+            "强拍/弱拍是根据本曲节拍位置的相对起音强度分类，不代表准确拍号或小节首拍。",
+            "重音候选来自起音强度峰值，可能包含鼓点、和弦起音或其他瞬态。",
+            "低能量区间不一定是真正静音，也可能是弱音、尾奏或编曲留白。",
+            "最后一个重音候选不一定等于歌曲最后一个重要音乐事件。",
+        ],
+    }
+
+
+# =========================================================
+# 7. 特征统计
 # =========================================================
 
 def safe_mean(values):
@@ -510,6 +602,7 @@ def run_music_timeline_analysis(audio_url, window_seconds=10, job_id=None):
             update_job(job_id, stage="building_segments", progress=65)
 
         segments = build_segments(data, window_seconds)
+        rhythm_details = analyze_rhythm_details(data)
         log_stage("segments_ready", started)
 
         if job_id:
@@ -561,6 +654,7 @@ def run_music_timeline_analysis(audio_url, window_seconds=10, job_id=None):
                 ),
             },
             "segments": segments,
+            "rhythm_analysis": rhythm_details,
             "section_candidates": candidates,
             "timeline": timeline,
             "limitations": [
@@ -642,7 +736,7 @@ def analyze_audio(audio_url: str):
             "average_rolloff_hz": round(safe_mean(data["rolloff"]), 2),
             "average_zero_crossing_rate": round(safe_mean(data["zcr"]), 5),
             "beat_times_seconds": [
-                round(float(t), 3) for t in data["beat_times"][:500]
+                round(float(t), 3) for t in data["beat_times"][:1500]
             ],
             "notes": [
                 "BPM 和调性属于算法估计值",

@@ -1097,4 +1097,9 @@ if __name__ == "__main__":
         PORT,
     )
 
-    mcp.run(transport="http")
+    mcp.run(
+        transport="http",
+        host=HOST,
+        port=PORT,
+        stateless_http=True,
+    )

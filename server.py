@@ -39,12 +39,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("music-analysis")
 
-mcp = FastMCP(
-    "music-analysis",
-    host=HOST,
-    port=PORT,
-    stateless_http=True,
-)
+mcp = FastMCP("music-analysis")
 
 # 免费实例资源有限，同一时间只运行一个重型分析任务
 ANALYSIS_LOCK = threading.Lock()

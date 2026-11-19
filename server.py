@@ -1,392 +1,468 @@
 
 import os
+import time
+import logging
 import tempfile
+import threading
 from urllib.parse import urlparse
 
 import requests
 import numpy as np
+import librosa
+
 from fastmcp import FastMCP
 
-mcp = FastMCP("Music Analysis")
 
-# -----------------------------
-# 基础配置：适配 Render Free
-# -----------------------------
+# =========================================================
+# 1. 基础配置
+# =========================================================
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "8000"))
 
 MAX_FILE_SIZE = 25 * 1024 * 1024
 MAX_ANALYSIS_SECONDS = 600
+
 SAMPLE_RATE = 11025
 HOP_LENGTH = 512
+N_FFT = 2048
 
 ALLOWED_HOSTS = {
     "tempfile.org",
-    "www.tempfile.org"
+    "www.tempfile.org",
 }
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-# -----------------------------
-# 音频下载与安全检查
-# -----------------------------
+logger = logging.getLogger("music-analysis")
 
-def validate_audio_url(audio_url):
-    parsed = urlparse(audio_url)
+mcp = FastMCP(
+    "music-analysis",
+    host=HOST,
+    port=PORT,
+    stateless_http=True,
+)
 
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname not in ALLOWED_HOSTS
-        or parsed.username
-        or parsed.password
-    ):
-        raise ValueError(
-            "目前只允许 tempfile.org 的 HTTPS 音频链接"
-        )
+# 免费实例资源有限，同一时间只运行一个重型分析任务
+ANALYSIS_LOCK = threading.Lock()
 
+
+# =========================================================
+# 2. 日志与内存监控
+# =========================================================
+
+def memory_mb():
+    """读取 Linux 进程当前常驻内存。"""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+
+    return None
+
+
+def log_stage(stage, started):
+    elapsed = round(time.perf_counter() - started, 2)
+    mem = memory_mb()
+
+    logger.info(
+        "[music-analysis] stage=%s elapsed=%ss memory=%sMB",
+        stage,
+        elapsed,
+        mem if mem is not None else "unknown",
+    )
+
+
+def acquire_analysis_lock():
+    return ANALYSIS_LOCK.acquire(blocking=False)
+
+
+# =========================================================
+# 3. 下载音频
+# =========================================================
 
 def download_audio(audio_url):
-    validate_audio_url(audio_url)
+    parsed = urlparse(audio_url)
 
-    downloaded = 0
-    path = None
+    if parsed.scheme != "https":
+        raise ValueError("只允许 HTTPS 音频链接")
+
+    if parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError(
+            "当前只允许 tempfile.org 音频链接"
+        )
+
+    if parsed.username or parsed.password:
+        raise ValueError("音频链接格式不合法")
 
     response = requests.get(
         audio_url,
         stream=True,
-        timeout=(15, 45),
+        timeout=(15, 90),
         allow_redirects=False,
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={
+            "User-Agent": "MusicAnalysisMCP/1.0"
+        },
     )
 
     try:
-        if 300 <= response.status_code < 400:
-            raise ValueError(
-                "音频链接发生重定向，请使用直接下载链接"
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"音频下载失败，HTTP 状态码：{response.status_code}"
             )
 
-        response.raise_for_status()
-
         content_type = response.headers.get(
-            "Content-Type", "unknown"
+            "Content-Type", ""
+        ).lower()
+
+        if "text/html" in content_type:
+            raise ValueError(
+                "链接返回的是网页，不是音频文件"
+            )
+
+        content_length = response.headers.get(
+            "Content-Length"
         )
-
-        if "text/html" in content_type.lower():
-            raise ValueError("下载到的是网页，不是音频文件")
-
-        content_length = response.headers.get("Content-Length")
 
         if content_length:
             if int(content_length) > MAX_FILE_SIZE:
-                raise ValueError("文件超过25MB限制")
+                raise ValueError("音频文件超过 25MB 限制")
+
+        temp_path = None
+        total_size = 0
 
         with tempfile.NamedTemporaryFile(
-            suffix=".audio",
-            delete=False
-        ) as f:
-            path = f.name
+            delete=False,
+            suffix=".mp3",
+        ) as temp_file:
+
+            temp_path = temp_file.name
 
             for chunk in response.iter_content(
-                chunk_size=64 * 1024
+                chunk_size=1024 * 1024
             ):
                 if not chunk:
                     continue
 
-                downloaded += len(chunk)
+                total_size += len(chunk)
 
-                if downloaded > MAX_FILE_SIZE:
-                    raise ValueError("文件超过25MB限制")
+                if total_size > MAX_FILE_SIZE:
+                    raise ValueError(
+                        "音频文件超过 25MB 限制"
+                    )
 
-                f.write(chunk)
+                temp_file.write(chunk)
 
-        if downloaded == 0:
-            raise ValueError("下载内容为空")
+        if total_size == 0:
+            raise ValueError("下载到的音频文件为空")
 
-        return path, {
-            "http_status": response.status_code,
+        return {
+            "path": temp_path,
+            "size_bytes": total_size,
             "content_type": content_type,
-            "downloaded_bytes": downloaded,
-            "downloaded_MB": round(
-                downloaded / 1024 / 1024, 2
-            ),
-            "final_url": response.url
         }
 
     except Exception:
-        if path and os.path.exists(path):
-            os.remove(path)
+        if "temp_path" in locals() and temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         raise
 
     finally:
         response.close()
 
 
-# -----------------------------
-# 音频读取
-# -----------------------------
+# =========================================================
+# 4. 音乐调性估计
+# =========================================================
 
-def load_audio_features(path):
-    import librosa
+KEY_NAMES = [
+    "C", "C#", "D", "D#", "E", "F",
+    "F#", "G", "G#", "A", "A#", "B",
+]
 
-    y, sr = librosa.load(
-        path,
-        sr=SAMPLE_RATE,
-        mono=True,
-        duration=MAX_ANALYSIS_SECONDS
+MAJOR_PROFILE = np.array([
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+    2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+], dtype=np.float32)
+
+MINOR_PROFILE = np.array([
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+    2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+], dtype=np.float32)
+
+
+def estimate_key(chroma):
+    chroma_mean = np.mean(chroma, axis=1)
+
+    if np.std(chroma_mean) < 1e-8:
+        return {
+            "key": None,
+            "mode": None,
+            "confidence": 0,
+            "note": "音高特征不足，无法可靠估计调性",
+        }
+
+    scores = []
+
+    for i in range(12):
+        major = np.roll(MAJOR_PROFILE, i)
+        minor = np.roll(MINOR_PROFILE, i)
+
+        major_corr = np.corrcoef(
+            chroma_mean, major
+        )[0, 1]
+
+        minor_corr = np.corrcoef(
+            chroma_mean, minor
+        )[0, 1]
+
+        scores.append((
+            major_corr,
+            KEY_NAMES[i],
+            "major",
+        ))
+
+        scores.append((
+            minor_corr,
+            KEY_NAMES[i],
+            "minor",
+        ))
+
+    scores = [
+        item for item in scores
+        if np.isfinite(item[0])
+    ]
+
+    if not scores:
+        return {
+            "key": None,
+            "mode": None,
+            "confidence": 0,
+            "note": "调性估计失败",
+        }
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+
+    best = scores[0]
+    second = scores[1]
+
+    confidence = max(
+        0.0,
+        float(best[0] - second[0])
     )
 
-    if len(y) == 0:
-        raise ValueError("没有读取到有效音频数据")
+    return {
+        "key": best[1],
+        "mode": best[2],
+        "key_name": (
+            f"{best[1]} {'大调' if best[2] == 'major' else '小调'}"
+        ),
+        "confidence": round(confidence, 4),
+        "note": "算法估计结果，不等同于人工听辨确认",
+    }
+
+
+# =========================================================
+# 5. 提取整首歌曲特征
+# =========================================================
+
+def load_audio_features(audio_path):
+    started = time.perf_counter()
+
+    y, sr = librosa.load(
+        audio_path,
+        sr=SAMPLE_RATE,
+        mono=True,
+        dtype=np.float32,
+    )
+
+    original_duration = len(y) / sr
+    truncated = False
+
+    if original_duration > MAX_ANALYSIS_SECONDS:
+        y = y[:int(MAX_ANALYSIS_SECONDS * sr)]
+        truncated = True
 
     duration = len(y) / sr
 
-    # 基础特征
+    if duration < 1:
+        raise ValueError("音频时长过短，无法分析")
+
+    log_stage("audio_loaded", started)
+
+    # RMS 音量
     rms = librosa.feature.rms(
         y=y,
-        hop_length=HOP_LENGTH
+        frame_length=N_FFT,
+        hop_length=HOP_LENGTH,
     )[0]
 
+    log_stage("rms", started)
+
+    # 频谱中心
     centroid = librosa.feature.spectral_centroid(
         y=y,
         sr=sr,
-        hop_length=HOP_LENGTH
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
     )[0]
 
+    log_stage("spectral_centroid", started)
+
+    # 频谱带宽
     bandwidth = librosa.feature.spectral_bandwidth(
         y=y,
         sr=sr,
-        hop_length=HOP_LENGTH
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
     )[0]
 
+    log_stage("spectral_bandwidth", started)
+
+    # 频谱滚降
     rolloff = librosa.feature.spectral_rolloff(
         y=y,
         sr=sr,
-        hop_length=HOP_LENGTH
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
     )[0]
 
+    log_stage("spectral_rolloff", started)
+
+    # 过零率
     zcr = librosa.feature.zero_crossing_rate(
-        y=y,
-        hop_length=HOP_LENGTH
+        y,
+        frame_length=N_FFT,
+        hop_length=HOP_LENGTH,
     )[0]
 
-    onset = librosa.onset.onset_strength(
-        y=y,
-        sr=sr,
-        hop_length=HOP_LENGTH
-    )
+    log_stage("zero_crossing_rate", started)
 
+    # 色度特征
     chroma = librosa.feature.chroma_stft(
         y=y,
         sr=sr,
-        hop_length=HOP_LENGTH
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
     )
 
-    # BPM 和节拍
-    tempo, beats = librosa.beat.beat_track(
+    log_stage("chroma", started)
+
+    # 节拍检测
+    onset_env = librosa.onset.onset_strength(
         y=y,
         sr=sr,
         hop_length=HOP_LENGTH,
-        trim=False
     )
 
-    bpm = float(
-        np.asarray(tempo).reshape(-1)[0]
+    tempo, beat_frames = librosa.beat.beat_track(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=HOP_LENGTH,
+        trim=False,
     )
+
+    del onset_env
 
     beat_times = librosa.frames_to_time(
-        beats,
+        beat_frames,
         sr=sr,
-        hop_length=HOP_LENGTH
+        hop_length=HOP_LENGTH,
     )
 
-    # 调性估计：同时比较大调和小调
-    major_profile = np.array([
-        6.35, 2.23, 3.48, 2.33,
-        4.38, 4.09, 2.52, 5.19,
-        2.39, 3.66, 2.29, 2.88
-    ])
+    if isinstance(tempo, np.ndarray):
+        bpm = float(np.asarray(tempo).reshape(-1)[0])
+    else:
+        bpm = float(tempo)
 
-    minor_profile = np.array([
-        6.33, 2.68, 3.52, 5.38,
-        2.60, 3.53, 2.54, 4.75,
-        3.98, 2.69, 3.34, 3.17
-    ])
+    log_stage("beat_tracking", started)
 
-    chroma_mean = chroma.mean(axis=1)
-
-    key_names = [
-        "C", "C#", "D", "D#", "E", "F",
-        "F#", "G", "G#", "A", "A#", "B"
+    # 统一各特征的帧数，避免时间轴错位
+    feature_lengths = [
+        len(rms),
+        len(centroid),
+        len(bandwidth),
+        len(rolloff),
+        len(zcr),
+        chroma.shape[1],
     ]
 
-    candidates = []
+    frame_count = min(feature_lengths)
 
-    for i in range(12):
-        rotated = np.roll(chroma_mean, -i)
+    rms = rms[:frame_count]
+    centroid = centroid[:frame_count]
+    bandwidth = bandwidth[:frame_count]
+    rolloff = rolloff[:frame_count]
+    zcr = zcr[:frame_count]
+    chroma = chroma[:, :frame_count]
 
-        for mode, profile in [
-            ("major", major_profile),
-            ("minor", minor_profile)
-        ]:
-            correlation = np.corrcoef(
-                rotated, profile
-            )[0, 1]
-
-            if np.isfinite(correlation):
-                candidates.append((
-                    float(correlation),
-                    key_names[i],
-                    mode
-                ))
-
-    candidates.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
-
-    if candidates:
-        best = candidates[0]
-        estimated_key = best[1] + " " + best[2]
-        key_confidence = round(best[0], 3)
-    else:
-        estimated_key = "unknown"
-        key_confidence = None
-
-    # 时间轴
     frame_times = librosa.frames_to_time(
-        np.arange(len(rms)),
+        np.arange(frame_count),
         sr=sr,
-        hop_length=HOP_LENGTH
+        hop_length=HOP_LENGTH,
     )
 
-    # 统一帧数，避免不同特征长度不一致
-    feature_arrays = {
-        "rms": rms,
-        "centroid": centroid,
-        "bandwidth": bandwidth,
-        "rolloff": rolloff,
-        "zcr": zcr
-    }
+    key_result = estimate_key(chroma)
+
+    log_stage("feature_extraction_complete", started)
 
     return {
         "y": y,
         "sr": sr,
         "duration": duration,
-        "bpm": bpm,
-        "beats": beat_times,
-        "key": estimated_key,
-        "key_confidence": key_confidence,
-        "frame_times": frame_times,
-        "features": feature_arrays,
+        "original_duration": original_duration,
+        "truncated": truncated,
+        "bpm": round(bpm, 2),
+        "beat_times": beat_times,
+        "beat_count": int(len(beat_times)),
+        "rms": rms,
+        "centroid": centroid,
+        "bandwidth": bandwidth,
+        "rolloff": rolloff,
+        "zcr": zcr,
         "chroma": chroma,
-        "onset": onset
+        "frame_times": frame_times,
+        "key": key_result,
     }
 
 
-# -----------------------------
-# 分段特征统计
-# -----------------------------
+# =========================================================
+# 6. 特征统计
+# =========================================================
+
+def safe_mean(values):
+    if len(values) == 0:
+        return 0.0
+
+    return float(np.mean(values))
+
 
 def build_segments(data, window_seconds=10):
-    frame_times = data["frame_times"]
-    features = data["features"]
-    beats = data["beats"]
-    duration = data["duration"]
+    window_seconds = max(
+        5, min(int(window_seconds), 30)
+    )
 
-    results = []
+    duration = data["duration"]
+    frame_times = data["frame_times"]
+
+    segments = []
 
     start = 0.0
 
     while start < duration:
         end = min(
             start + window_seconds,
-            duration
+            duration,
         )
-
-        mask = (
-            (frame_times >= start)
-            & (frame_times < end)
-        )
-
-        if not np.any(mask):
-            start = end
-            continue
-
-        def mean_value(name):
-            return float(
-                np.mean(features[name][mask])
-            )
-
-        rms_value = mean_value("rms")
-
-        segment_beats = beats[
-            (beats >= start) & (beats < end)
-        ]
-
-        results.append({
-            "start": round(start, 2),
-            "end": round(end, 2),
-            "duration": round(end - start, 2),
-            "rms_energy": round(rms_value, 5),
-            "energy_dbfs_approx": round(
-                20 * np.log10(max(rms_value, 1e-8)),
-                2
-            ),
-            "spectral_centroid_hz": round(
-                mean_value("centroid"), 2
-            ),
-            "spectral_bandwidth_hz": round(
-                mean_value("bandwidth"), 2
-            ),
-            "spectral_rolloff_hz": round(
-                mean_value("rolloff"), 2
-            ),
-            "zero_crossing_rate": round(
-                mean_value("zcr"), 5
-            ),
-            "beat_count": int(len(segment_beats)),
-            "beat_density_per_second": round(
-                len(segment_beats) / max(end - start, 0.01),
-                3
-            )
-        })
-
-        start = end
-
-    return results
-
-
-# -----------------------------
-# 音乐变化检测
-# -----------------------------
-
-def find_section_candidates(
-    data,
-    window_seconds=5,
-    min_gap_seconds=12,
-    max_candidates=12
-):
-    import librosa
-
-    y = data["y"]
-    sr = data["sr"]
-
-    # MFCC 用于描述不同时间段的音色特征
-    mfcc = librosa.feature.mfcc(
-        y=y,
-        sr=sr,
-        n_mfcc=13,
-        hop_length=HOP_LENGTH
-    )
-
-    chroma = data["chroma"]
-    frame_times = data["frame_times"]
-    duration = data["duration"]
-
-    vectors = []
-    window_starts = []
-
-    start = 0.0
-
-    while start + window_seconds <= duration:
-        end = start + window_seconds
 
         mask = (
             (frame_times >= start)
@@ -394,440 +470,636 @@ def find_section_candidates(
         )
 
         if np.any(mask):
-            mfcc_mean = mfcc[:, mask].mean(axis=1)
-            chroma_mean = chroma[:, mask].mean(axis=1)
+            rms_mean = safe_mean(
+                data["rms"][mask]
+            )
+
+            segments.append({
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "duration": round(end - start, 2),
+
+                "rms": round(rms_mean, 5),
+
+                "approx_dbfs": round(
+                    20 * np.log10(
+                        max(rms_mean, 1e-8)
+                    ),
+                    2,
+                ),
+
+                "spectral_centroid_hz": round(
+                    safe_mean(data["centroid"][mask]),
+                    2,
+                ),
+
+                "spectral_bandwidth_hz": round(
+                    safe_mean(data["bandwidth"][mask]),
+                    2,
+                ),
+
+                "spectral_rolloff_hz": round(
+                    safe_mean(data["rolloff"][mask]),
+                    2,
+                ),
+
+                "zero_crossing_rate": round(
+                    safe_mean(data["zcr"][mask]),
+                    5,
+                ),
+
+                "beat_count": int(
+                    np.sum(
+                        (data["beat_times"] >= start)
+                        & (data["beat_times"] < end)
+                    )
+                ),
+            })
+
+        start = end
+
+    return segments
+
+
+# =========================================================
+# 7. 音乐结构变化候选点
+# =========================================================
+
+def find_section_candidates(
+    data,
+    window_seconds=5,
+    min_gap_seconds=12,
+    max_candidates=12,
+):
+    window_seconds = max(
+        5, min(int(window_seconds), 30)
+    )
+
+    min_gap_seconds = max(
+        3, int(min_gap_seconds)
+    )
+
+    max_candidates = max(
+        1, min(int(max_candidates), 30)
+    )
+
+    y = data["y"]
+    sr = data["sr"]
+    duration = data["duration"]
+
+    started = time.perf_counter()
+
+    # MFCC 只计算一次，不在每个时间窗口重复提取
+    mfcc = librosa.feature.mfcc(
+        y=y,
+        sr=sr,
+        n_mfcc=13,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+    )
+
+    log_stage("mfcc", started)
+
+    frame_times = data["frame_times"]
+
+    common_length = min(
+        mfcc.shape[1],
+        data["chroma"].shape[1],
+        len(frame_times),
+    )
+
+    mfcc = mfcc[:, :common_length]
+    chroma = data["chroma"][:, :common_length]
+    frame_times = frame_times[:common_length]
+
+    windows = []
+    start = 0.0
+
+    while start < duration:
+        end = min(
+            start + window_seconds,
+            duration,
+        )
+
+        mask = (
+            (frame_times >= start)
+            & (frame_times < end)
+        )
+
+        if np.any(mask):
+            mfcc_mean = np.mean(
+                mfcc[:, mask],
+                axis=1,
+            )
+
+            chroma_mean = np.mean(
+                chroma[:, mask],
+                axis=1,
+            )
 
             vector = np.concatenate([
                 mfcc_mean,
-                chroma_mean
-            ])
+                chroma_mean,
+            ]).astype(np.float32)
 
-            vectors.append(vector)
-            window_starts.append(start)
+            norm = np.linalg.norm(vector)
 
-        start += window_seconds
+            if norm > 1e-8:
+                vector = vector / norm
 
-    if len(vectors) < 3:
+            windows.append({
+                "start": start,
+                "end": end,
+                "vector": vector,
+            })
+
+        start = end
+
+    del mfcc
+
+    if len(windows) < 2:
         return []
 
-    vectors = np.asarray(vectors)
+    changes = []
 
-    # 对特征向量进行标准化
-    mean = vectors.mean(axis=0)
-    std = vectors.std(axis=0) + 1e-6
+    for i in range(1, len(windows)):
+        previous = windows[i - 1]["vector"]
+        current = windows[i]["vector"]
 
-    normalized = (vectors - mean) / std
-
-    scores = []
-
-    for i in range(1, len(normalized)):
-        a = normalized[i - 1]
-        b = normalized[i]
-
-        denominator = (
-            np.linalg.norm(a)
-            * np.linalg.norm(b)
+        similarity = float(
+            np.dot(previous, current)
         )
 
-        if denominator == 0:
-            score = 0.0
-        else:
-            score = 1 - float(
-                np.dot(a, b) / denominator
-            )
+        distance = 1.0 - similarity
 
-        scores.append({
-            "time": window_starts[i],
-            "score": max(0.0, score)
+        changes.append({
+            "time": round(
+                windows[i]["start"], 2
+            ),
+            "distance": round(
+                float(distance), 4
+            ),
         })
 
-    if not scores:
+    if not changes:
         return []
 
-    score_values = np.array([
-        item["score"] for item in scores
-    ])
+    distances = np.array(
+        [item["distance"] for item in changes],
+        dtype=np.float32,
+    )
 
-    threshold = (
-        float(np.median(score_values))
-        + 0.75 * float(np.std(score_values))
+    threshold = float(
+        np.mean(distances)
+        + 0.5 * np.std(distances)
     )
 
     candidates = [
-        item for item in scores
-        if item["score"] >= threshold
+        item for item in changes
+        if item["distance"] >= threshold
     ]
 
     candidates.sort(
-        key=lambda item: item["score"],
-        reverse=True
+        key=lambda item: item["distance"],
+        reverse=True,
     )
 
     selected = []
 
     for item in candidates:
         if all(
-            abs(item["time"] - chosen["time"])
+            abs(item["time"] - old["time"])
             >= min_gap_seconds
-            for chosen in selected
+            for old in selected
         ):
             selected.append(item)
 
         if len(selected) >= max_candidates:
             break
 
-    selected.sort(key=lambda item: item["time"])
+    selected.sort(
+        key=lambda item: item["time"]
+    )
 
     return [
         {
-            "time": round(item["time"], 2),
-            "feature_change_score": round(
-                item["score"], 4
-            ),
-            "label": "possible_section_change"
+            "time": item["time"],
+            "change_score": item["distance"],
+            "description": "可能的音乐段落变化点，需结合听感确认",
         }
         for item in selected
     ]
 
 
-# -----------------------------
-# 工具1：下载测试
-# -----------------------------
+# =========================================================
+# 8. 统一错误处理
+# =========================================================
+
+def error_result(exc):
+    logger.exception(
+        "[music-analysis] analysis_failed"
+    )
+
+    return {
+        "success": False,
+        "error": str(exc),
+        "memory_mb": memory_mb(),
+    }
+
+
+def cleanup_audio(path):
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            logger.warning(
+                "临时音频文件清理失败"
+            )
+
+
+# =========================================================
+# 9. MCP 工具一：测试音频下载
+# =========================================================
 
 @mcp.tool()
-def test_audio_download(audio_url: str) -> dict:
-    """测试音频能否下载，不进行音乐分析。"""
+def test_audio_download(audio_url: str):
+    """
+    测试音频链接是否可访问，并检查文件大小和类型。
+    """
 
     path = None
 
     try:
-        path, info = download_audio(audio_url)
+        result = download_audio(audio_url)
+        path = result["path"]
 
         return {
             "success": True,
-            **info,
-            "message": "下载读取完成，未进行音乐分析"
+            "message": "音频下载成功",
+            "size_bytes": result["size_bytes"],
+            "size_mb": round(
+                result["size_bytes"] / 1024 / 1024,
+                2,
+            ),
+            "content_type": result["content_type"],
+            "memory_mb": memory_mb(),
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
+    except Exception as exc:
+        return error_result(exc)
 
     finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+        cleanup_audio(path)
 
 
-# -----------------------------
-# 工具2：全曲音乐分析
-# -----------------------------
+# =========================================================
+# 10. MCP 工具二：全曲基础分析
+# =========================================================
 
 @mcp.tool()
-def analyze_audio(audio_url: str) -> dict:
+def analyze_audio(audio_url: str):
     """
-    分析整首歌曲，返回 BPM、节拍、调性、
-    能量、音色及频谱特征。
+    分析整首音频的时长、BPM、节拍数量、调性和基础音乐特征。
     """
+
+    if not acquire_analysis_lock():
+        return {
+            "success": False,
+            "error": "已有分析任务正在运行，请稍后再试",
+        }
 
     path = None
 
     try:
-        path, info = download_audio(audio_url)
+        started = time.perf_counter()
+
+        downloaded = download_audio(audio_url)
+        path = downloaded["path"]
+
+        log_stage("download_complete", started)
+
         data = load_audio_features(path)
 
-        y = data["y"]
-
-        return {
+        result = {
             "success": True,
-            **info,
-            "analyzed_seconds": round(
+            "duration_seconds": round(
                 data["duration"], 2
             ),
-            "sample_rate": data["sr"],
-            "bpm": round(data["bpm"], 2),
-            "beat_count": int(len(data["beats"])),
-            "beat_times_seconds": [
-                round(float(t), 2)
-                for t in data["beats"][:500]
-            ],
-            "estimated_key": data["key"],
-            "key_confidence": data["key_confidence"],
-            "average_rms_energy": round(
-                float(np.mean(data["features"]["rms"])),
-                5
+            "original_duration_seconds": round(
+                data["original_duration"], 2
             ),
-            "average_spectral_centroid_hz": round(
-                float(np.mean(
-                    data["features"]["centroid"]
-                )), 2
+            "truncated": data["truncated"],
+            "sample_rate": SAMPLE_RATE,
+            "bpm": data["bpm"],
+            "beat_count": data["beat_count"],
+            "key": data["key"],
+            "average_rms": round(
+                safe_mean(data["rms"]), 5
             ),
-            "average_spectral_bandwidth_hz": round(
-                float(np.mean(
-                    data["features"]["bandwidth"]
-                )), 2
+            "average_centroid_hz": round(
+                safe_mean(data["centroid"]), 2
             ),
-            "average_spectral_rolloff_hz": round(
-                float(np.mean(
-                    data["features"]["rolloff"]
-                )), 2
+            "average_bandwidth_hz": round(
+                safe_mean(data["bandwidth"]), 2
+            ),
+            "average_rolloff_hz": round(
+                safe_mean(data["rolloff"]), 2
             ),
             "average_zero_crossing_rate": round(
-                float(np.mean(
-                    data["features"]["zcr"]
-                )), 5
+                safe_mean(data["zcr"]), 5
             ),
-            "message": (
-                "全曲基础音乐特征分析完成。"
-                "调性为算法估计，需结合听感核验。"
-            )
+            "beat_times_seconds": [
+                round(float(t), 3)
+                for t in data["beat_times"][:500]
+            ],
+            "notes": [
+                "BPM 和调性属于算法估计值",
+                "节拍检测可能存在漏检或误检",
+                "本工具不负责歌词识别",
+            ],
+            "memory_mb": memory_mb(),
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
+        log_stage("analysis_complete", started)
+
+        del data
+
+        return result
+
+    except Exception as exc:
+        return error_result(exc)
 
     finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+        cleanup_audio(path)
+        ANALYSIS_LOCK.release()
 
 
-# -----------------------------
-# 工具3：分段音乐特征
-# -----------------------------
+# =========================================================
+# 11. MCP 工具三：分段音乐特征分析
+# =========================================================
 
 @mcp.tool()
 def analyze_audio_segments(
     audio_url: str,
-    window_seconds: int = 10
-) -> dict:
+    window_seconds: int = 10,
+):
     """
-    按时间窗口分析音乐能量、音色、
-    频谱和节拍密度变化。
+    按时间窗口分析音量、频谱、节拍密度等音乐特征。
     """
+
+    if not acquire_analysis_lock():
+        return {
+            "success": False,
+            "error": "已有分析任务正在运行，请稍后再试",
+        }
 
     path = None
 
     try:
-        if window_seconds < 5 or window_seconds > 30:
-            raise ValueError(
-                "window_seconds 必须在5到30秒之间"
-            )
+        started = time.perf_counter()
 
-        path, info = download_audio(audio_url)
+        downloaded = download_audio(audio_url)
+        path = downloaded["path"]
+
         data = load_audio_features(path)
 
         segments = build_segments(
             data,
-            window_seconds
+            window_seconds,
         )
 
-        return {
+        result = {
             "success": True,
-            **info,
-            "analyzed_seconds": round(
+            "duration_seconds": round(
                 data["duration"], 2
             ),
-            "window_seconds": window_seconds,
+            "window_seconds": max(
+                5, min(int(window_seconds), 30)
+            ),
             "segment_count": len(segments),
             "segments": segments,
-            "message": (
-                "分段音乐特征分析完成。"
-                "能量值为RMS近似值，不是LUFS响度。"
-            )
+            "memory_mb": memory_mb(),
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
+        log_stage("segments_complete", started)
+
+        del data
+
+        return result
+
+    except Exception as exc:
+        return error_result(exc)
 
     finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+        cleanup_audio(path)
+        ANALYSIS_LOCK.release()
 
 
-# -----------------------------
-# 工具4：音乐结构变化检测
-# -----------------------------
+# =========================================================
+# 12. MCP 工具四：音乐结构变化检测
+# =========================================================
 
 @mcp.tool()
 def detect_music_sections(
     audio_url: str,
     window_seconds: int = 5,
     min_gap_seconds: int = 12,
-    max_candidates: int = 12
-) -> dict:
+    max_candidates: int = 12,
+):
     """
-    根据MFCC和色度特征变化寻找疑似音乐段落边界。
-    不直接判断主歌、副歌等语义标签。
+    检测音乐特征变化较明显的位置，提供可能的段落变化候选点。
+    不会直接断定主歌、副歌或桥段。
     """
+
+    if not acquire_analysis_lock():
+        return {
+            "success": False,
+            "error": "已有分析任务正在运行，请稍后再试",
+        }
 
     path = None
 
     try:
-        if window_seconds < 3 or window_seconds > 15:
-            raise ValueError(
-                "window_seconds 必须在3到15秒之间"
-            )
+        started = time.perf_counter()
 
-        if min_gap_seconds < 5:
-            raise ValueError(
-                "min_gap_seconds 不能小于5秒"
-            )
+        downloaded = download_audio(audio_url)
+        path = downloaded["path"]
 
-        if max_candidates < 1 or max_candidates > 20:
-            raise ValueError(
-                "max_candidates 必须在1到20之间"
-            )
-
-        path, info = download_audio(audio_url)
         data = load_audio_features(path)
 
         candidates = find_section_candidates(
             data,
             window_seconds=window_seconds,
             min_gap_seconds=min_gap_seconds,
-            max_candidates=max_candidates
+            max_candidates=max_candidates,
         )
 
-        return {
+        result = {
             "success": True,
-            **info,
-            "analyzed_seconds": round(
+            "duration_seconds": round(
                 data["duration"], 2
             ),
-            "section_candidates": candidates,
             "candidate_count": len(candidates),
+            "section_candidates": candidates,
             "warning": (
-                "这些是声学特征变化候选点，"
-                "不等于已经确认的主歌、副歌或间奏边界。"
-            )
+                "变化点不等于正式音乐结构标签。"
+                "主歌、副歌、前奏等需要结合听感或其他信息判断。"
+            ),
+            "memory_mb": memory_mb(),
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
+        log_stage("section_detection_complete", started)
+
+        del data
+
+        return result
+
+    except Exception as exc:
+        return error_result(exc)
 
     finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+        cleanup_audio(path)
+        ANALYSIS_LOCK.release()
 
 
-# -----------------------------
-# 工具5：生成音乐时间轴
-# -----------------------------
+# =========================================================
+# 13. MCP 工具五：生成完整音乐时间轴
+# =========================================================
 
 @mcp.tool()
 def generate_music_timeline(
     audio_url: str,
-    window_seconds: int = 10
-) -> dict:
+    window_seconds: int = 10,
+):
     """
-    整合全曲基础分析、分段特征和音乐变化候选点，
-    生成供Claude进行音乐理解的时间轴。
+    一次性生成整首音乐的基础分析、分段特征和结构变化候选点。
     """
+
+    if not acquire_analysis_lock():
+        return {
+            "success": False,
+            "error": "已有分析任务正在运行，请稍后再试",
+        }
 
     path = None
 
     try:
-        if window_seconds < 5 or window_seconds > 30:
-            raise ValueError(
-                "window_seconds 必须在5到30秒之间"
-            )
+        started = time.perf_counter()
 
-        path, info = download_audio(audio_url)
+        downloaded = download_audio(audio_url)
+        path = downloaded["path"]
+
+        log_stage("download_complete", started)
+
+        # 只加载和分析一次
         data = load_audio_features(path)
+
+        log_stage("features_ready", started)
 
         segments = build_segments(
             data,
-            window_seconds
+            window_seconds,
         )
+
+        log_stage("segments_ready", started)
 
         candidates = find_section_candidates(
             data,
             window_seconds=5,
             min_gap_seconds=12,
-            max_candidates=12
+            max_candidates=20,
         )
+
+        log_stage("section_candidates_ready", started)
 
         timeline = []
 
-        for segment in segments[:60]:
+        for segment in segments:
             timeline.append({
                 "time": segment["start"],
-                "type": "segment_summary",
-                "energy": segment["rms_energy"],
-                "spectral_centroid_hz": (
-                    segment["spectral_centroid_hz"]
-                ),
-                "beat_density": (
-                    segment["beat_density_per_second"]
-                )
+                "type": "audio_segment",
+                "data": segment,
             })
 
         for candidate in candidates:
             timeline.append({
                 "time": candidate["time"],
                 "type": "possible_section_change",
-                "score": candidate[
-                    "feature_change_score"
-                ]
+                "data": candidate,
             })
 
-        timeline.sort(key=lambda item: item["time"])
+        timeline.sort(
+            key=lambda item: item["time"]
+        )
 
-        return {
+        result = {
             "success": True,
-            **info,
-            "duration_seconds": round(
-                data["duration"], 2
-            ),
-            "global_analysis": {
-                "bpm": round(data["bpm"], 2),
-                "beat_count": int(len(data["beats"])),
-                "estimated_key": data["key"],
-                "key_confidence": data["key_confidence"]
+
+            "song": {
+                "duration_seconds": round(
+                    data["duration"], 2
+                ),
+                "original_duration_seconds": round(
+                    data["original_duration"], 2
+                ),
+                "truncated": data["truncated"],
+                "sample_rate": SAMPLE_RATE,
             },
-            "segments": segments[:60],
+
+            "music_overview": {
+                "bpm": data["bpm"],
+                "beat_count": data["beat_count"],
+                "key": data["key"],
+                "average_rms": round(
+                    safe_mean(data["rms"]), 5
+                ),
+                "average_centroid_hz": round(
+                    safe_mean(data["centroid"]), 2
+                ),
+                "average_bandwidth_hz": round(
+                    safe_mean(data["bandwidth"]), 2
+                ),
+            },
+
+            "segments": segments,
+
             "section_candidates": candidates,
+
             "timeline": timeline,
-            "message": (
-                "音乐时间轴生成完成。"
-                "请结合歌词和听感进一步确认音乐段落及情绪。"
-            )
+
+            "limitations": [
+                "音乐变化候选点不等于正式段落标签",
+                "不能仅凭频谱特征准确判断歌词内容",
+                "情绪和叙事含义需要结合歌词、听感及背景资料分析",
+                "本工具不输出完整歌词",
+            ],
+
+            "memory_mb": memory_mb(),
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
+        log_stage("timeline_complete", started)
+
+        del data
+
+        return result
+
+    except Exception as exc:
+        return error_result(exc)
 
     finally:
-        if path and os.path.exists(path):
-            os.remove(path)
+        cleanup_audio(path)
+        ANALYSIS_LOCK.release()
 
 
-# -----------------------------
-# MCP 服务启动
-# -----------------------------
+# =========================================================
+# 14. 启动 MCP 服务
+# =========================================================
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        stateless_http=True
+    logger.info(
+        "Starting music-analysis MCP on %s:%s",
+        HOST,
+        PORT,
     )
+
+    mcp.run(transport="http")

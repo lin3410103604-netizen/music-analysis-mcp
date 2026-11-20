@@ -4,12 +4,20 @@ import uuid
 import logging
 import tempfile
 import threading
+import sqlite3
+import json
+import csv
+import io
+import secrets
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 import numpy as np
 import librosa
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse
 
 
 # =========================================================
@@ -45,6 +53,90 @@ ANALYSIS_LOCK = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
+# SQLite 持久化：Render 免费实例默认 /tmp 仍是临时存储。
+# 若 Render 挂载了 Persistent Disk，请设置 MUSIC_DATA_DIR=/var/data。
+DATA_DIR = Path(os.environ.get("MUSIC_DATA_DIR", "/tmp/music-analysis-data"))
+EXPORT_DIR = DATA_DIR / "exports"
+DB_PATH = DATA_DIR / "music_analysis.sqlite3"
+DOWNLOAD_TTL_SECONDS = 24 * 60 * 60
+
+
+def db_connect():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_database():
+    with db_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            stage TEXT,
+            progress INTEGER,
+            created_at REAL,
+            updated_at REAL,
+            window_seconds INTEGER,
+            result_json TEXT,
+            error TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS exports (
+            token TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )""")
+        conn.commit()
+
+
+def persist_job(job):
+    result_json = json.dumps(job.get("result"), ensure_ascii=False, separators=(",", ":")) if job.get("result") is not None else None
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO jobs
+            (job_id,status,stage,progress,created_at,updated_at,window_seconds,result_json,error)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              status=excluded.status, stage=excluded.stage, progress=excluded.progress,
+              updated_at=excluded.updated_at, window_seconds=excluded.window_seconds,
+              result_json=COALESCE(excluded.result_json, jobs.result_json), error=excluded.error
+        """, (job["job_id"], job.get("status", "queued"), job.get("stage"),
+              job.get("progress", 0), job.get("created_at", time.time()),
+              job.get("updated_at", time.time()), job.get("window_seconds", 10),
+              result_json, job.get("error")))
+        conn.commit()
+
+
+def load_persisted_jobs():
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("SELECT * FROM jobs").fetchall()
+        now = time.time()
+        with JOBS_LOCK:
+            for row in rows:
+                if row["status"] in ("queued", "running"):
+                    # 进程重启后，后台线程不可能继续运行；明确标记为中断。
+                    status = "interrupted"
+                    stage = "interrupted_after_restart"
+                    error = "服务进程重启，原后台任务已中断；请使用已有结果或重新启动分析。"
+                else:
+                    status, stage, error = row["status"], row["stage"], row["error"]
+                result = json.loads(row["result_json"]) if row["result_json"] else None
+                JOBS[row["job_id"]] = {
+                    "job_id": row["job_id"], "status": status, "stage": stage,
+                    "progress": row["progress"] or 0, "created_at": row["created_at"],
+                    "updated_at": row["updated_at"], "window_seconds": row["window_seconds"] or 10,
+                    "result": result, "error": error,
+                }
+                if status == "interrupted":
+                    persist_job(JOBS[row["job_id"]])
+    except Exception:
+        logger.exception("[music-analysis] failed_to_load_persisted_jobs")
+
+
+init_database()
+
 
 # =========================================================
 # 2. 日志、内存监控与任务状态
@@ -77,16 +169,21 @@ def acquire_analysis_lock():
 
 
 def cleanup_old_jobs():
-    """清理超过保留时间的已完成/失败任务，避免任务字典无限增长。"""
+    """清理过期任务与下载记录。"""
     now = time.time()
     with JOBS_LOCK:
-        expired = [
-            job_id for job_id, job in JOBS.items()
-            if job.get("status") in ("done", "failed")
-            and now - job.get("updated_at", now) > JOB_TTL_SECONDS
-        ]
+        expired = [job_id for job_id, job in JOBS.items()
+                   if job.get("status") in ("done", "failed", "interrupted")
+                   and now - job.get("updated_at", now) > JOB_TTL_SECONDS]
         for job_id in expired:
             JOBS.pop(job_id, None)
+    if expired:
+        with db_connect() as conn:
+            conn.executemany("DELETE FROM jobs WHERE job_id=?", [(x,) for x in expired])
+            conn.commit()
+    with db_connect() as conn:
+        conn.execute("DELETE FROM exports WHERE created_at < ?", (now - DOWNLOAD_TTL_SECONDS,))
+        conn.commit()
 
 
 def update_job(job_id, **updates):
@@ -95,6 +192,11 @@ def update_job(job_id, **updates):
         if job is not None:
             job.update(updates)
             job["updated_at"] = time.time()
+            snapshot = dict(job)
+        else:
+            snapshot = None
+    if snapshot is not None:
+        persist_job(snapshot)
 
 
 # =========================================================
@@ -935,6 +1037,7 @@ def start_audio_analysis(audio_url: str, window_seconds: int = 10):
             "result": None,
             "error": None,
         }
+        persist_job(dict(JOBS[job_id]))
 
     try:
         thread = threading.Thread(
@@ -1055,10 +1158,193 @@ def get_analysis_result(job_id: str):
 
 
 # =========================================================
+# 17. 精简查询、分页读取、报告与文件导出
+# =========================================================
+
+def get_job_snapshot(job_id):
+    cleanup_old_jobs()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def low_energy_flag(timestamp, intervals):
+    return any(float(item.get("start", 0)) <= timestamp <= float(item.get("end", 0))
+               for item in (intervals or []))
+
+
+@mcp.tool()
+def get_analysis_summary(job_id: str):
+    """只返回音乐分析摘要，不返回642条完整节拍，适合低Token工作流。"""
+    job = get_job_snapshot(job_id)
+    if not job:
+        return {"success": False, "error": "找不到任务", "job_id": job_id}
+    if job["status"] != "done" or not job.get("result"):
+        return {"success": True, "job_id": job_id, "status": job["status"],
+                "stage": job.get("stage"), "progress": job.get("progress"),
+                "error": job.get("error")}
+    result = job["result"]
+    rhythm = result.get("rhythm_analysis", {})
+    beats = rhythm.get("beat_points", [])
+    # 约每8小节取一个样本：仅在明确按4/4拍假设时，每32拍取样。
+    sampled = [{"beat_index": i + 1, **beats[i]} for i in range(0, len(beats), 32)]
+    return {
+        "success": True, "job_id": job_id, "status": "done",
+        "song": result.get("song", {}),
+        "music_overview": result.get("music_overview", {}),
+        "beat_count": len(beats),
+        "beat_sampling": {"assumption": "仅作4/4拍假设，每32个检测节拍采样一次；未检测拍号",
+                          "interval_beats": 32, "items": sampled},
+        "accent_candidates": rhythm.get("accent_candidates", []),
+        "low_energy_intervals": rhythm.get("low_energy_intervals", []),
+        "last_accent_candidate": rhythm.get("last_accent_candidate"),
+        "section_candidates": result.get("section_candidates", []),
+        "limitations": result.get("limitations", []),
+    }
+
+
+@mcp.tool()
+def get_beats(job_id: str, offset: int = 0, limit: int = 50):
+    """分页读取节拍点。limit最大100；offset从0开始。"""
+    job = get_job_snapshot(job_id)
+    if not job:
+        return {"success": False, "error": "找不到任务", "job_id": job_id}
+    if job["status"] != "done" or not job.get("result"):
+        return {"success": False, "job_id": job_id, "status": job["status"],
+                "message": "分析尚未完成或结果不可用", "error": job.get("error")}
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), 100))
+    rhythm = job["result"].get("rhythm_analysis", {})
+    beats = rhythm.get("beat_points", [])
+    page = beats[offset:offset + limit]
+    intervals = rhythm.get("low_energy_intervals", [])
+    items = [{**item, "in_low_energy_interval": low_energy_flag(float(item.get("time", 0)), intervals)}
+             for item in page]
+    return {"success": True, "job_id": job_id, "offset": offset, "limit": limit,
+            "returned": len(items), "total": len(beats),
+            "next_offset": offset + len(items) if offset + len(items) < len(beats) else None,
+            "items": items}
+
+
+def register_export(job_id, filename, content_bytes):
+    safe_name = Path(filename).name
+    file_path = EXPORT_DIR / f"{uuid.uuid4().hex}_{safe_name}"
+    file_path.write_bytes(content_bytes)
+    token = secrets.token_urlsafe(32)
+    with db_connect() as conn:
+        conn.execute("INSERT INTO exports(token,file_path,filename,created_at) VALUES(?,?,?,?)",
+                     (token, str(file_path), safe_name, time.time()))
+        conn.commit()
+    base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if not base_url:
+        return {"success": False, "error": "文件已生成，但尚未配置 PUBLIC_BASE_URL，无法构造外部下载链接。",
+                "filename": safe_name, "stored_path": str(file_path),
+                "required_env": "PUBLIC_BASE_URL，例如 https://你的Render服务.onrender.com"}
+    return {"success": True, "filename": safe_name,
+            "download_url": f"{base_url}/download?token={token}",
+            "expires_in_seconds": DOWNLOAD_TTL_SECONDS,
+            "note": "下载链接持有者可在有效期内下载，请勿公开分享。"}
+
+
+@mcp.tool()
+def export_analysis_data(job_id: str, format: str = "json"):
+    """在MCP服务端生成JSON或CSV文件，返回下载链接；不把完整数据交给模型。"""
+    job = get_job_snapshot(job_id)
+    if not job:
+        return {"success": False, "error": "找不到任务", "job_id": job_id}
+    if job["status"] != "done" or not job.get("result"):
+        return {"success": False, "job_id": job_id, "status": job["status"],
+                "error": "分析尚未完成或结果不可用"}
+    fmt = (format or "json").lower().strip()
+    result = job["result"]
+    if fmt == "json":
+        payload = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
+        filename = f"{job_id}_analysis.json"
+    elif fmt == "csv":
+        rhythm = result.get("rhythm_analysis", {})
+        intervals = rhythm.get("low_energy_intervals", [])
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=["time", "relative_strength", "accent_class", "in_low_energy_interval"])
+        writer.writeheader()
+        for item in rhythm.get("beat_points", []):
+            t = float(item.get("time", 0))
+            writer.writerow({"time": item.get("time"),
+                             "relative_strength": item.get("relative_strength"),
+                             "accent_class": item.get("accent_class"),
+                             "in_low_energy_interval": low_energy_flag(t, intervals)})
+        payload = output.getvalue().encode("utf-8-sig")
+        filename = f"{job_id}_beats.csv"
+    else:
+        return {"success": False, "error": "format仅支持json或csv"}
+    return register_export(job_id, filename, payload)
+
+
+@mcp.tool()
+def generate_song_report(job_id: str):
+    """基于现有分析结果在服务端生成song.md，不重新分析音频。"""
+    job = get_job_snapshot(job_id)
+    if not job:
+        return {"success": False, "error": "找不到任务", "job_id": job_id}
+    if job["status"] != "done" or not job.get("result"):
+        return {"success": False, "job_id": job_id, "status": job["status"],
+                "error": "分析尚未完成或结果不可用"}
+    result = job["result"]
+    song = result.get("song", {})
+    overview = result.get("music_overview", {})
+    rhythm = result.get("rhythm_analysis", {})
+    lines = [f"# 音乐分析报告：{job_id}", "",
+             "## 基础信息", f"- 时长：{song.get('duration_seconds', '未知')} 秒",
+             f"- BPM：{overview.get('bpm', '未知')}",
+             f"- 节拍总数：{rhythm.get('beat_point_count', overview.get('beat_count', '未知'))}",
+             f"- 调性估计：{overview.get('key', {})}", "",
+             "## 音乐变化候选点"]
+    for item in result.get("section_candidates", []):
+        lines.append(f"- {item.get('time')} 秒：变化分数 {item.get('change_score')}（需听感确认）")
+    lines += ["", "## 重音候选"]
+    for item in rhythm.get("accent_candidates", [])[:30]:
+        lines.append(f"- {item.get('time')} 秒：强度 {item.get('strength')}（需听感确认）")
+    lines += ["", "## 低能量区间"]
+    for item in rhythm.get("low_energy_intervals", []):
+        lines.append(f"- {item.get('start')}–{item.get('end')} 秒：{item.get('description', '需听感确认')}")
+    lines += ["", "## 导演分析待补充", "- 前奏、主歌、副歌、桥段和尾奏：需结合实际听感与转写进一步标注。",
+              "- 情绪与叙事：当前算法没有直接识别情绪，不应仅凭音频特征臆测。",
+              "- 镜头与转场建议：待结合人工确认的段落和歌词内容补充。", "",
+              "## 分析限制"]
+    for item in result.get("limitations", []):
+        lines.append(f"- {item}")
+    payload = ("\n".join(lines) + "\n").encode("utf-8")
+    return register_export(job_id, f"{job_id}_song.md", payload)
+
+
+@mcp.custom_route("/download", methods=["GET"], include_in_schema=False)
+async def download_export(request: Request):
+    """随机令牌保护的短期下载路由。自定义路由不继承MCP认证，令牌本身即下载凭证。"""
+    token = request.query_params.get("token", "")
+    if not token or len(token) > 128:
+        return JSONResponse({"success": False, "error": "缺少或无效的下载令牌"}, status_code=400)
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM exports WHERE token=?", (token,)).fetchone()
+    if not row or time.time() - row["created_at"] > DOWNLOAD_TTL_SECONDS:
+        return JSONResponse({"success": False, "error": "下载链接不存在或已过期"}, status_code=404)
+    path = Path(row["file_path"]).resolve()
+    if path.parent != EXPORT_DIR.resolve() or not path.is_file():
+        return JSONResponse({"success": False, "error": "文件不存在"}, status_code=404)
+    return FileResponse(str(path), filename=row["filename"], media_type="application/octet-stream")
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(request: Request):
+    return JSONResponse({"status": "healthy", "service": "music-analysis",
+                         "database_path": str(DB_PATH),
+                         "persistent_disk_configured": str(DATA_DIR).startswith("/var/data")})
+
+
+# =========================================================
 # 17. 启动 MCP 服务
 # =========================================================
 
 if __name__ == "__main__":
+    load_persisted_jobs()
     logger.info("Starting music-analysis MCP on %s:%s", HOST, PORT)
     mcp.run(
         transport="http",

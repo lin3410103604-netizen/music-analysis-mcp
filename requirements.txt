@@ -5,3 +5,4 @@ soundfile
 numpy
 requests
 starlette
+psycopg[binary]>=3.2,<4

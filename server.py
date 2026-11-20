@@ -1175,32 +1175,119 @@ def low_energy_flag(timestamp, intervals):
 
 @mcp.tool()
 def get_analysis_summary(job_id: str):
-    """只返回音乐分析摘要，不返回642条完整节拍，适合低Token工作流。"""
+    """返回精简音乐摘要；完整节拍和原始分析结果仍保留在服务端。"""
     job = get_job_snapshot(job_id)
     if not job:
         return {"success": False, "error": "找不到任务", "job_id": job_id}
-    if job["status"] != "done" or not job.get("result"):
-        return {"success": True, "job_id": job_id, "status": job["status"],
-                "stage": job.get("stage"), "progress": job.get("progress"),
-                "error": job.get("error")}
+
+    if job.get("status") != "done" or not job.get("result"):
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "stage": job.get("stage"),
+            "progress": job.get("progress"),
+            "error": job.get("error"),
+        }
+
     result = job["result"]
-    rhythm = result.get("rhythm_analysis", {})
-    beats = rhythm.get("beat_points", [])
-    # 约每8小节取一个样本：仅在明确按4/4拍假设时，每32拍取样。
-    sampled = [{"beat_index": i + 1, **beats[i]} for i in range(0, len(beats), 32)]
+    rhythm = result.get("rhythm_analysis") or {}
+
+    # 音乐结构候选点最多保留20个，只保留真实存在的字段。
+    section_candidates = []
+    for item in (result.get("section_candidates") or [])[:20]:
+        section_candidates.append({
+            "time": item.get("time"),
+            "change_score": item.get("change_score"),
+        })
+
+    # 先按强度选出最强10个，再按时间排序，便于阅读时间轴。
+    all_accents = rhythm.get("accent_candidates") or []
+    strongest_accents = sorted(
+        all_accents,
+        key=lambda item: float(item.get("strength", 0) or 0),
+        reverse=True,
+    )[:10]
+    accent_candidates = [
+        {"time": item.get("time"), "strength": item.get("strength")}
+        for item in sorted(
+            strongest_accents,
+            key=lambda item: float(item.get("time", 0) or 0),
+        )
+    ]
+
+    # 最长的8个低能量区间优先保留，最后按开始时间排序。
+    all_low_energy = rhythm.get("low_energy_intervals") or []
+    longest_intervals = sorted(
+        all_low_energy,
+        key=lambda item: float(item.get("duration", 0) or 0),
+        reverse=True,
+    )[:8]
+    low_energy_intervals = [
+        {
+            "start": item.get("start"),
+            "end": item.get("end"),
+            "duration": item.get("duration"),
+        }
+        for item in sorted(
+            longest_intervals,
+            key=lambda item: float(item.get("start", 0) or 0),
+        )
+    ]
+
+    # 均匀抽取最多12个节拍样本，并保留原始节拍序号。
+    beats = rhythm.get("beat_points") or []
+    max_samples = 12
+    if len(beats) <= max_samples:
+        sample_indices = list(range(len(beats)))
+    elif max_samples == 1:
+        sample_indices = [0]
+    else:
+        sample_indices = sorted({
+            round(i * (len(beats) - 1) / (max_samples - 1))
+            for i in range(max_samples)
+        })
+
+    sampled = []
+    for index in sample_indices:
+        beat = beats[index]
+        sampled.append({
+            "beat_index": index + 1,
+            "time": beat.get("time"),
+            "relative_strength": beat.get("relative_strength"),
+            "accent_class": beat.get("accent_class"),
+        })
+
+    last_accent = rhythm.get("last_accent_candidate")
+    compact_last_accent = None
+    if isinstance(last_accent, dict):
+        compact_last_accent = {
+            "time": last_accent.get("time"),
+            "strength": last_accent.get("strength"),
+        }
+
     return {
-        "success": True, "job_id": job_id, "status": "done",
+        "success": True,
+        "job_id": job_id,
+        "status": "done",
         "song": result.get("song", {}),
         "music_overview": result.get("music_overview", {}),
         "beat_count": len(beats),
-        "beat_sampling": {"assumption": "仅作4/4拍假设，每32个检测节拍采样一次；未检测拍号",
-                          "interval_beats": 32, "items": sampled},
-        "accent_candidates": rhythm.get("accent_candidates", []),
-        "low_energy_intervals": rhythm.get("low_energy_intervals", []),
-        "last_accent_candidate": rhythm.get("last_accent_candidate"),
-        "section_candidates": result.get("section_candidates", []),
-        "limitations": result.get("limitations", []),
+        "section_candidates_total": len(result.get("section_candidates") or []),
+        "section_candidates": section_candidates,
+        "beat_sampling": {
+            "assumption": "均匀抽样最多12个检测节拍；未检测拍号",
+            "sample_count": len(sampled),
+            "items": sampled,
+        },
+        "accent_candidates_total": len(all_accents),
+        "accent_candidates": accent_candidates,
+        "low_energy_intervals_total": len(all_low_energy),
+        "low_energy_intervals": low_energy_intervals,
+        "last_accent_candidate": compact_last_accent,
+        "limitations": (result.get("limitations") or [])[:3],
     }
+
 
 
 @mcp.tool()

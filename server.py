@@ -4,20 +4,21 @@ import uuid
 import logging
 import tempfile
 import threading
-import sqlite3
 import json
 import csv
 import io
 import secrets
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 import numpy as np
 import librosa
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import JSONResponse, Response
+from psycopg import connect as pg_connect
+from psycopg.rows import dict_row
 
 
 # =========================================================
@@ -35,8 +36,9 @@ N_FFT = 2048
 
 ALLOWED_HOSTS = {"tempfile.org", "www.tempfile.org"}
 
-# 内存任务记录保留时间。Render 重启/休眠后，内存任务记录会丢失。
-JOB_TTL_SECONDS = 6 * 60 * 60
+# PostgreSQL 保存任务；内存字典仅作为当前进程的快速缓存。
+# 默认保留任务 30 天，避免短时间内因清理规则丢失结果；可通过环境变量调整。
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,20 +55,24 @@ ANALYSIS_LOCK = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-# SQLite 持久化：Render 免费实例默认 /tmp 仍是临时存储。
-# 若 Render 挂载了 Persistent Disk，请设置 MUSIC_DATA_DIR=/var/data。
-DATA_DIR = Path(os.environ.get("MUSIC_DATA_DIR", "/tmp/music-analysis-data"))
-EXPORT_DIR = DATA_DIR / "exports"
-DB_PATH = DATA_DIR / "music_analysis.sqlite3"
-DOWNLOAD_TTL_SECONDS = 24 * 60 * 60
+# Render Free 的本地文件系统不作为持久化存储。
+# 所有任务记录和导出文件内容均保存到 Neon PostgreSQL。
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DOWNLOAD_TTL_SECONDS = int(os.environ.get("DOWNLOAD_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 
 
 def db_connect():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("缺少 DATABASE_URL 环境变量，无法连接 Neon PostgreSQL")
+    # Neon pooled connection string 使用 SSL；关闭客户端 prepared statements
+    # 以兼容 PgBouncer transaction pooling。每次操作使用短连接，避免空闲连接堆积。
+    return pg_connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=10,
+        prepare_threshold=None,
+        application_name="music-analysis-mcp",
+    )
 
 
 def init_database():
@@ -76,19 +82,20 @@ def init_database():
             status TEXT NOT NULL,
             stage TEXT,
             progress INTEGER,
-            created_at REAL,
-            updated_at REAL,
+            created_at DOUBLE PRECISION,
+            updated_at DOUBLE PRECISION,
             window_seconds INTEGER,
             result_json TEXT,
             error TEXT
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS exports (
             token TEXT PRIMARY KEY,
-            file_path TEXT NOT NULL,
             filename TEXT NOT NULL,
-            created_at REAL NOT NULL
+            content BYTEA NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL
         )""")
         conn.commit()
+    logger.info("[music-analysis] PostgreSQL schema ready; export content stored in database")
 
 
 def persist_job(job):
@@ -96,7 +103,7 @@ def persist_job(job):
     with db_connect() as conn:
         conn.execute("""INSERT INTO jobs
             (job_id,status,stage,progress,created_at,updated_at,window_seconds,result_json,error)
-            VALUES (?,?,?,?,?,?,?,?,?)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT(job_id) DO UPDATE SET
               status=excluded.status, stage=excluded.stage, progress=excluded.progress,
               updated_at=excluded.updated_at, window_seconds=excluded.window_seconds,
@@ -179,10 +186,10 @@ def cleanup_old_jobs():
             JOBS.pop(job_id, None)
     if expired:
         with db_connect() as conn:
-            conn.executemany("DELETE FROM jobs WHERE job_id=?", [(x,) for x in expired])
+            conn.executemany("DELETE FROM jobs WHERE job_id=%s", [(x,) for x in expired])
             conn.commit()
     with db_connect() as conn:
-        conn.execute("DELETE FROM exports WHERE created_at < ?", (now - DOWNLOAD_TTL_SECONDS,))
+        conn.execute("DELETE FROM exports WHERE created_at < %s", (now - DOWNLOAD_TTL_SECONDS,))
         conn.commit()
 
 
@@ -1315,22 +1322,23 @@ def get_beats(job_id: str, offset: int = 0, limit: int = 50):
 
 def register_export(job_id, filename, content_bytes):
     safe_name = Path(filename).name
-    file_path = EXPORT_DIR / f"{uuid.uuid4().hex}_{safe_name}"
-    file_path.write_bytes(content_bytes)
     token = secrets.token_urlsafe(32)
     with db_connect() as conn:
-        conn.execute("INSERT INTO exports(token,file_path,filename,created_at) VALUES(?,?,?,?)",
-                     (token, str(file_path), safe_name, time.time()))
+        conn.execute(
+            "INSERT INTO exports(token,filename,content,created_at) VALUES(%s,%s,%s,%s)",
+            (token, safe_name, content_bytes, time.time()),
+        )
         conn.commit()
     base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if not base_url:
-        return {"success": False, "error": "文件已生成，但尚未配置 PUBLIC_BASE_URL，无法构造外部下载链接。",
-                "filename": safe_name, "stored_path": str(file_path),
+        return {"success": False, "error": "文件已保存到 PostgreSQL，但尚未配置 PUBLIC_BASE_URL，无法构造外部下载链接。",
+                "filename": safe_name, "storage": "postgresql",
                 "required_env": "PUBLIC_BASE_URL，例如 https://你的Render服务.onrender.com"}
     return {"success": True, "filename": safe_name,
             "download_url": f"{base_url}/download?token={token}",
+            "storage": "postgresql",
             "expires_in_seconds": DOWNLOAD_TTL_SECONDS,
-            "note": "下载链接持有者可在有效期内下载，请勿公开分享。"}
+            "note": "文件内容保存在 PostgreSQL；下载令牌在有效期内可用，请勿公开分享。"}
 
 
 @mcp.tool()
@@ -1410,20 +1418,41 @@ async def download_export(request: Request):
     if not token or len(token) > 128:
         return JSONResponse({"success": False, "error": "缺少或无效的下载令牌"}, status_code=400)
     with db_connect() as conn:
-        row = conn.execute("SELECT * FROM exports WHERE token=?", (token,)).fetchone()
+        row = conn.execute("SELECT * FROM exports WHERE token=%s", (token,)).fetchone()
     if not row or time.time() - row["created_at"] > DOWNLOAD_TTL_SECONDS:
         return JSONResponse({"success": False, "error": "下载链接不存在或已过期"}, status_code=404)
-    path = Path(row["file_path"]).resolve()
-    if path.parent != EXPORT_DIR.resolve() or not path.is_file():
-        return JSONResponse({"success": False, "error": "文件不存在"}, status_code=404)
-    return FileResponse(str(path), filename=row["filename"], media_type="application/octet-stream")
+    filename = row["filename"]
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"}
+    return Response(
+        content=bytes(row["content"]),
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health_check(request: Request):
-    return JSONResponse({"status": "healthy", "service": "music-analysis",
-                         "database_path": str(DB_PATH),
-                         "persistent_disk_configured": str(DATA_DIR).startswith("/var/data")})
+    try:
+        with db_connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return JSONResponse({
+            "status": "healthy",
+            "service": "music-analysis",
+            "database_backend": "postgresql",
+            "database_connected": True,
+            "storage_backend": "postgresql",
+            "job_retention_seconds": JOB_TTL_SECONDS,
+            "export_link_ttl_seconds": DOWNLOAD_TTL_SECONDS,
+        })
+    except Exception as exc:
+        logger.exception("[music-analysis] health_check_database_failed")
+        return JSONResponse({
+            "status": "unhealthy",
+            "service": "music-analysis",
+            "database_backend": "postgresql",
+            "database_connected": False,
+            "error": "数据库连接失败，请检查 Render 的 DATABASE_URL 和 Neon 状态。",
+        }, status_code=503)
 
 
 # =========================================================
@@ -1432,7 +1461,7 @@ async def health_check(request: Request):
 
 if __name__ == "__main__":
     load_persisted_jobs()
-    logger.info("Starting music-analysis MCP on %s:%s", HOST, PORT)
+    logger.info("Starting music-analysis MCP on %s:%s using Neon PostgreSQL", HOST, PORT)
     mcp.run(
         transport="http",
         host=HOST,

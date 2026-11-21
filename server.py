@@ -1296,6 +1296,122 @@ def get_analysis_summary(job_id: str):
     }
 
 
+@mcp.tool()
+def get_analysis_timeline(job_id: str):
+    """返回完整分段时间轴与精简节奏摘要；不返回全部 beat_points，完整节拍请使用 get_beats 分页读取。"""
+    job = get_job_snapshot(job_id)
+    if not job:
+        return {
+            "success": False,
+            "error": "找不到任务",
+            "job_id": job_id,
+        }
+
+    if job.get("status") != "done" or not job.get("result"):
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": job.get("status"),
+            "stage": job.get("stage"),
+            "progress": job.get("progress"),
+            "error": job.get("error"),
+            "message": "分析尚未完成或结果不可用，请先使用 get_analysis_status 查询任务状态。",
+        }
+
+    result = job["result"]
+    segments = result.get("segments") or []
+    section_candidates = result.get("section_candidates") or []
+    rhythm = result.get("rhythm_analysis") or {}
+
+    # 优先使用分析时生成的完整事件时间轴；兼容缺少 timeline 字段的旧任务结果。
+    timeline = result.get("timeline") or []
+    if not timeline:
+        timeline = []
+        for segment in segments:
+            timeline.append({
+                "time": segment.get("start", 0),
+                "type": "audio_segment",
+                "data": segment,
+            })
+        for candidate in section_candidates:
+            timeline.append({
+                "time": candidate.get("time", 0),
+                "type": "possible_section_change",
+                "data": candidate,
+            })
+        timeline.sort(key=lambda item: float(item.get("time", 0) or 0))
+
+    # 只返回最强的10个重音候选，避免把大量起音峰值塞进一次响应。
+    all_accents = rhythm.get("accent_candidates") or []
+    strongest_accents = sorted(
+        all_accents,
+        key=lambda item: float(item.get("strength", 0) or 0),
+        reverse=True,
+    )[:10]
+    compact_accents = [
+        {"time": item.get("time"), "strength": item.get("strength")}
+        for item in sorted(
+            strongest_accents,
+            key=lambda item: float(item.get("time", 0) or 0),
+        )
+    ]
+
+    # 最长的8个低能量区间优先保留，并按开始时间排序。
+    all_low_energy = rhythm.get("low_energy_intervals") or []
+    longest_intervals = sorted(
+        all_low_energy,
+        key=lambda item: float(item.get("duration", 0) or 0),
+        reverse=True,
+    )[:8]
+    compact_low_energy = [
+        {
+            "start": item.get("start"),
+            "end": item.get("end"),
+            "duration": item.get("duration"),
+            "description": item.get("description"),
+        }
+        for item in sorted(
+            longest_intervals,
+            key=lambda item: float(item.get("start", 0) or 0),
+        )
+    ]
+
+    last_accent = rhythm.get("last_accent_candidate")
+    compact_last_accent = None
+    if isinstance(last_accent, dict):
+        compact_last_accent = {
+            "time": last_accent.get("time"),
+            "strength": last_accent.get("strength"),
+        }
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": "done",
+        "song": result.get("song", {}),
+        "music_overview": result.get("music_overview", {}),
+        "segment_count": len(segments),
+        "section_candidate_count": len(section_candidates),
+        "timeline_event_count": len(timeline),
+        "timeline": timeline,
+        "rhythm_overview": {
+            "beat_count": len(rhythm.get("beat_points") or []),
+            "relative_strong_beat_threshold": rhythm.get("relative_strong_beat_threshold"),
+            "accent_candidates_total": len(all_accents),
+            "strongest_accent_candidates": compact_accents,
+            "low_energy_intervals_total": len(all_low_energy),
+            "low_energy_intervals": compact_low_energy,
+            "last_accent_candidate": compact_last_accent,
+            "notes": (rhythm.get("notes") or [])[:4],
+        },
+        "limitations": (result.get("limitations") or [])[:4],
+        "omitted_data": {
+            "beat_points": "本工具不返回全部节拍点，以避免响应过大。",
+            "how_to_get_all_beats": "调用 get_beats(job_id, offset, limit) 分页读取；limit最大100，offset从0开始。",
+        },
+    }
+
+
 
 @mcp.tool()
 def get_beats(job_id: str, offset: int = 0, limit: int = 50):

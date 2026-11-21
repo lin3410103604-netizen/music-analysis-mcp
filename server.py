@@ -60,6 +60,9 @@ JOBS_LOCK = threading.Lock()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DOWNLOAD_TTL_SECONDS = int(os.environ.get("DOWNLOAD_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 
+# Keep MCP tool responses comfortably below common gateway/client limits.
+MAX_INLINE_RESULT_CHARS = 12000
+
 
 def db_connect():
     if not DATABASE_URL:
@@ -947,26 +950,11 @@ def detect_music_sections(
 
 
 # =========================================================
-# 13. MCP 工具五：生成完整音乐时间轴（旧同步工具，保留）
-# =========================================================
-
-@mcp.tool()
-def generate_music_timeline(audio_url: str, window_seconds: int = 10):
-    """同步生成完整音乐时间轴；长音频建议使用 start_audio_analysis 异步版本。"""
-    if not acquire_analysis_lock():
-        return {"success": False, "error": "已有分析任务正在运行，请稍后再试"}
-    try:
-        return run_music_timeline_analysis(audio_url, window_seconds)
-    finally:
-        ANALYSIS_LOCK.release()
-
-
-# =========================================================
-# 14. 新 MCP 工具六：启动异步分析
+# 13-14. 统一使用后台分析，避免长时间同步请求超时
 # =========================================================
 
 def analysis_worker(job_id, audio_url, window_seconds):
-    """后台线程执行任务；不会占用 4Router 的工具调用等待时间。"""
+    """后台线程执行完整分析；MCP 请求只负责快速返回 job_id。"""
     try:
         update_job(
             job_id,
@@ -999,87 +987,129 @@ def analysis_worker(job_id, audio_url, window_seconds):
             )
     except Exception as exc:
         logger.exception("[music-analysis] background_job_failed")
-        update_job(
-            job_id,
-            status="failed",
-            stage="failed",
-            error=str(exc),
-            result={
-                "success": False,
-                "error": str(exc),
-                "memory_mb": memory_mb(),
-            },
-        )
+        try:
+            update_job(
+                job_id,
+                status="failed",
+                stage="failed",
+                error=str(exc),
+                result={
+                    "success": False,
+                    "error": str(exc),
+                    "memory_mb": memory_mb(),
+                },
+            )
+        except Exception:
+            logger.exception("[music-analysis] failed_to_persist_job_error")
     finally:
         ANALYSIS_LOCK.release()
+
+
+def _start_background_analysis(audio_url: str, window_seconds: int = 10):
+    """创建并启动一个完整音频分析任务；只返回轻量任务凭证。"""
+    cleanup_old_jobs()
+
+    try:
+        normalized_window = max(5, min(int(window_seconds), 30))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "status": "invalid_arguments",
+            "error": "window_seconds 必须是 5 到 30 之间的整数。",
+        }
+
+    if not acquire_analysis_lock():
+        return {
+            "success": False,
+            "status": "busy",
+            "error": "已有音乐分析任务正在运行，请先查询该任务或稍后再试。",
+        }
+
+    job_id = "music_" + uuid.uuid4().hex[:12]
+    now = time.time()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "queued",
+        "progress": 0,
+        "created_at": now,
+        "updated_at": now,
+        "window_seconds": normalized_window,
+        "result": None,
+        "error": None,
+    }
+
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    try:
+        # 先持久化任务，再启动线程，避免任务刚返回就无法查询。
+        persist_job(dict(job))
+        thread = threading.Thread(
+            target=analysis_worker,
+            args=(job_id, audio_url, normalized_window),
+            daemon=True,
+            name=f"music-analysis-{job_id}",
+        )
+        thread.start()
+    except Exception as exc:
+        with JOBS_LOCK:
+            failed_job = JOBS.get(job_id)
+            if failed_job is not None:
+                failed_job.update({
+                    "status": "failed",
+                    "stage": "failed",
+                    "error": f"后台任务启动失败：{exc}",
+                    "updated_at": time.time(),
+                })
+                failed_snapshot = dict(failed_job)
+            else:
+                failed_snapshot = None
+        if failed_snapshot is not None:
+            try:
+                persist_job(failed_snapshot)
+            except Exception:
+                logger.exception("[music-analysis] failed_to_persist_startup_error")
+        ANALYSIS_LOCK.release()
+        logger.exception("[music-analysis] background_thread_start_failed")
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": "failed",
+            "error": f"后台任务启动失败：{exc}",
+        }
+
+    return {
+        "success": True,
+        "message": "完整音乐分析任务已在后台启动",
+        "job_id": job_id,
+        "status": "queued",
+        "window_seconds": normalized_window,
+        "execution_mode": "background",
+        "next_step": (
+            "稍后调用 get_analysis_status(job_id) 查询进度；"
+            "完成后调用 get_analysis_summary 或 get_analysis_timeline 分页读取结果。"
+            "完整原始数据请使用 export_analysis_data 下载。"
+        ),
+    }
+
+
+@mcp.tool()
+def generate_music_timeline(audio_url: str, window_seconds: int = 10):
+    """
+    兼容旧工具名称，但改为后台执行，立即返回 job_id。
+    避免 2 分钟以上的同步请求被 4Router 或中间网关超时中断。
+    """
+    return _start_background_analysis(audio_url, window_seconds)
 
 
 @mcp.tool()
 def start_audio_analysis(audio_url: str, window_seconds: int = 10):
     """
     启动后台完整音乐分析，立即返回 job_id。
-    后续使用 get_analysis_status 查询进度，使用 get_analysis_result 获取结果。
+    后续使用 get_analysis_status 查询进度。
     """
-    cleanup_old_jobs()
-
-    if not acquire_analysis_lock():
-        return {
-            "success": False,
-            "status": "busy",
-            "error": "已有音乐分析任务正在运行，请先查询该任务或稍后再试",
-        }
-
-    job_id = "music_" + uuid.uuid4().hex[:12]
-    now = time.time()
-
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "progress": 0,
-            "created_at": now,
-            "updated_at": now,
-            "window_seconds": max(5, min(int(window_seconds), 30)),
-            "result": None,
-            "error": None,
-        }
-        persist_job(dict(JOBS[job_id]))
-
-    try:
-        thread = threading.Thread(
-            target=analysis_worker,
-            args=(job_id, audio_url, max(5, min(int(window_seconds), 30))),
-            daemon=True,
-            name=f"music-analysis-{job_id}",
-        )
-        thread.start()
-    except Exception as exc:
-        update_job(
-            job_id,
-            status="failed",
-            stage="failed",
-            error=f"后台任务启动失败：{exc}",
-        )
-        ANALYSIS_LOCK.release()
-        return {
-            "success": False,
-            "job_id": job_id,
-            "status": "failed",
-            "error": str(exc),
-        }
-
-    return {
-        "success": True,
-        "message": "分析任务已启动",
-        "job_id": job_id,
-        "status": "queued",
-        "window_seconds": max(5, min(int(window_seconds), 30)),
-        "next_step": (
-            "请使用 get_analysis_status，并传入此 job_id 查询进度；"
-            "状态为 done 后，再使用 get_analysis_result 获取完整结果。"
-        ),
-    }
+    return _start_background_analysis(audio_url, window_seconds)
 
 
 # =========================================================
@@ -1117,11 +1147,81 @@ def get_analysis_status(job_id: str):
 # 16. 新 MCP 工具八：获取异步分析结果
 # =========================================================
 
+def _compact_result_view(result):
+    """构造适合 MCP/LLM 客户端传输的精简结果，不修改数据库中的原始结果。"""
+    result = result or {}
+    rhythm = result.get("rhythm_analysis") or {}
+    beats = rhythm.get("beat_points") or []
+    accents = rhythm.get("accent_candidates") or []
+    low_energy = rhythm.get("low_energy_intervals") or []
+    sections = result.get("section_candidates") or []
+    segments = result.get("segments") or []
+    timeline = result.get("timeline") or []
+
+    strongest_accents = sorted(
+        accents,
+        key=lambda item: float(item.get("strength", 0) or 0),
+        reverse=True,
+    )[:10]
+    strongest_accents = sorted(
+        [
+            {"time": item.get("time"), "strength": item.get("strength")}
+            for item in strongest_accents
+        ],
+        key=lambda item: float(item.get("time", 0) or 0),
+    )
+
+    last_accent = rhythm.get("last_accent_candidate")
+    if isinstance(last_accent, dict):
+        last_accent = {
+            "time": last_accent.get("time"),
+            "strength": last_accent.get("strength"),
+        }
+
+    return {
+        "success": bool(result.get("success", True)),
+        "song": result.get("song") or {},
+        "music_overview": result.get("music_overview") or {},
+        "data_counts": {
+            "segment_count": len(segments),
+            "timeline_event_count": len(timeline) or (len(segments) + len(sections)),
+            "section_candidate_count": len(sections),
+            "beat_count": len(beats),
+            "accent_candidate_count": len(accents),
+            "low_energy_interval_count": len(low_energy),
+        },
+        "section_candidates": [
+            {
+                "time": item.get("time"),
+                "change_score": item.get("change_score"),
+            }
+            for item in sections[:20]
+        ],
+        "rhythm_overview": {
+            "relative_strong_beat_threshold": rhythm.get("relative_strong_beat_threshold"),
+            "strongest_accent_candidates": strongest_accents,
+            "low_energy_intervals": [
+                {
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "duration": item.get("duration"),
+                    "description": item.get("description"),
+                }
+                for item in low_energy[:20]
+            ],
+            "last_accent_candidate": last_accent,
+            "notes": (rhythm.get("notes") or [])[:4],
+        },
+        "limitations": (result.get("limitations") or [])[:4],
+    }
+
+
 @mcp.tool()
-def get_analysis_result(job_id: str):
+def get_analysis_result(job_id: str, include_full_result: bool = False):
     """
-    获取后台分析结果。
-    若仍在运行，会立即返回 running 状态，不会持续等待。
+    获取分析结果。默认返回精简结果，避免数万字符响应被客户端截断。
+    include_full_result=true 仅在完整 JSON 不超过 MAX_INLINE_RESULT_CHARS 时内联返回；
+    更大的原始结果请使用 export_analysis_data 下载。
     """
     cleanup_old_jobs()
 
@@ -1130,37 +1230,66 @@ def get_analysis_result(job_id: str):
         if not job:
             return {
                 "success": False,
-                "error": "找不到该任务。可能任务 ID 不正确，或 Render 服务重启后内存任务记录已清空。",
+                "error": "数据库和当前服务缓存中都找不到该任务。",
                 "job_id": job_id,
             }
 
-        if job["status"] in ("queued", "running"):
+        status = job.get("status")
+        if status in ("queued", "running"):
             return {
                 "success": True,
                 "job_id": job_id,
-                "status": job["status"],
-                "stage": job["stage"],
-                "progress": job["progress"],
-                "message": "分析尚未完成，请稍后再次调用 get_analysis_result。",
+                "status": status,
+                "stage": job.get("stage"),
+                "progress": job.get("progress"),
+                "message": "分析尚未完成，请稍后再次查询。",
             }
 
-        if job["status"] == "failed":
+        if status != "done":
             return {
                 "success": False,
                 "job_id": job_id,
-                "status": "failed",
-                "error": job.get("error") or "分析失败",
-                "result": job.get("result"),
+                "status": status,
+                "error": job.get("error") or "分析结果不可用",
             }
 
-        # done：复制引用后离开锁，再返回结果
         result = job.get("result")
 
+    if not isinstance(result, dict):
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": "done",
+            "error": "任务状态为 done，但数据库中没有可读取的结果对象。",
+        }
+
+    serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    result_chars = len(serialized)
+
+    if include_full_result and result_chars <= MAX_INLINE_RESULT_CHARS:
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "done",
+            "result_mode": "full",
+            "result_chars": result_chars,
+            "result": result,
+        }
+
+    compact = _compact_result_view(result)
     return {
         "success": True,
         "job_id": job_id,
         "status": "done",
-        "result": result,
+        "result_mode": "compact",
+        "result_chars": result_chars,
+        "result": compact,
+        "full_result_available": True,
+        "full_result_delivery": (
+            "完整原始结果保留在 PostgreSQL。请调用 export_analysis_data(job_id, format='json') "
+            "获取下载链接；节拍使用 get_beats 分页读取；时间轴使用 get_analysis_timeline 分页读取。"
+        ),
+        "full_result_inline_limit_chars": MAX_INLINE_RESULT_CHARS,
     }
 
 
@@ -1297,15 +1426,15 @@ def get_analysis_summary(job_id: str):
 
 
 @mcp.tool()
-def get_analysis_timeline(job_id: str):
-    """返回完整分段时间轴与精简节奏摘要；不返回全部 beat_points，完整节拍请使用 get_beats 分页读取。"""
+def get_analysis_timeline(job_id: str, offset: int = 0, limit: int = 12):
+    """
+    分页读取完整音乐时间轴事件。
+    默认每页12项，最多12项；所有分段和变化候选点均可通过 offset 完整读取。
+    全部节拍请使用 get_beats 分页读取。
+    """
     job = get_job_snapshot(job_id)
     if not job:
-        return {
-            "success": False,
-            "error": "找不到任务",
-            "job_id": job_id,
-        }
+        return {"success": False, "error": "找不到任务", "job_id": job_id}
 
     if job.get("status") != "done" or not job.get("result"):
         return {
@@ -1323,7 +1452,6 @@ def get_analysis_timeline(job_id: str):
     section_candidates = result.get("section_candidates") or []
     rhythm = result.get("rhythm_analysis") or {}
 
-    # 优先使用分析时生成的完整事件时间轴；兼容缺少 timeline 字段的旧任务结果。
     timeline = result.get("timeline") or []
     if not timeline:
         timeline = []
@@ -1341,28 +1469,33 @@ def get_analysis_timeline(job_id: str):
             })
         timeline.sort(key=lambda item: float(item.get("time", 0) or 0))
 
-    # 只返回最强的10个重音候选，避免把大量起音峰值塞进一次响应。
+    try:
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), 12))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "job_id": job_id,
+            "error": "offset 必须是非负整数，limit 必须是 1 到 12 之间的整数。",
+        }
+
+    page = timeline[offset:offset + limit]
+    next_offset = offset + len(page)
     all_accents = rhythm.get("accent_candidates") or []
     strongest_accents = sorted(
         all_accents,
         key=lambda item: float(item.get("strength", 0) or 0),
         reverse=True,
     )[:10]
-    compact_accents = [
-        {"time": item.get("time"), "strength": item.get("strength")}
-        for item in sorted(
-            strongest_accents,
-            key=lambda item: float(item.get("time", 0) or 0),
-        )
-    ]
+    compact_accents = sorted(
+        [
+            {"time": item.get("time"), "strength": item.get("strength")}
+            for item in strongest_accents
+        ],
+        key=lambda item: float(item.get("time", 0) or 0),
+    )
 
-    # 最长的8个低能量区间优先保留，并按开始时间排序。
     all_low_energy = rhythm.get("low_energy_intervals") or []
-    longest_intervals = sorted(
-        all_low_energy,
-        key=lambda item: float(item.get("duration", 0) or 0),
-        reverse=True,
-    )[:8]
     compact_low_energy = [
         {
             "start": item.get("start"),
@@ -1370,16 +1503,12 @@ def get_analysis_timeline(job_id: str):
             "duration": item.get("duration"),
             "description": item.get("description"),
         }
-        for item in sorted(
-            longest_intervals,
-            key=lambda item: float(item.get("start", 0) or 0),
-        )
+        for item in all_low_energy[:20]
     ]
 
     last_accent = rhythm.get("last_accent_candidate")
-    compact_last_accent = None
     if isinstance(last_accent, dict):
-        compact_last_accent = {
+        last_accent = {
             "time": last_accent.get("time"),
             "strength": last_accent.get("strength"),
         }
@@ -1388,12 +1517,16 @@ def get_analysis_timeline(job_id: str):
         "success": True,
         "job_id": job_id,
         "status": "done",
-        "song": result.get("song", {}),
-        "music_overview": result.get("music_overview", {}),
+        "song": result.get("song") or {},
+        "music_overview": result.get("music_overview") or {},
         "segment_count": len(segments),
         "section_candidate_count": len(section_candidates),
         "timeline_event_count": len(timeline),
-        "timeline": timeline,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "next_offset": next_offset if next_offset < len(timeline) else None,
+        "timeline": page,
         "rhythm_overview": {
             "beat_count": len(rhythm.get("beat_points") or []),
             "relative_strong_beat_threshold": rhythm.get("relative_strong_beat_threshold"),
@@ -1401,16 +1534,15 @@ def get_analysis_timeline(job_id: str):
             "strongest_accent_candidates": compact_accents,
             "low_energy_intervals_total": len(all_low_energy),
             "low_energy_intervals": compact_low_energy,
-            "last_accent_candidate": compact_last_accent,
+            "last_accent_candidate": last_accent,
             "notes": (rhythm.get("notes") or [])[:4],
         },
         "limitations": (result.get("limitations") or [])[:4],
         "omitted_data": {
-            "beat_points": "本工具不返回全部节拍点，以避免响应过大。",
-            "how_to_get_all_beats": "调用 get_beats(job_id, offset, limit) 分页读取；limit最大100，offset从0开始。",
+            "beat_points": "本页不返回全部节拍点；请使用 get_beats(job_id, offset, limit) 分页读取。",
+            "full_json": "完整原始 JSON 请使用 export_analysis_data(job_id, format='json') 下载。",
         },
     }
-
 
 
 @mcp.tool()
